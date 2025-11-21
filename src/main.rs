@@ -1,7 +1,7 @@
 #[allow(unused_imports)]
 use std::net::UdpSocket;
 
-use codecrafters_dns_server::DnsPacketBuffer;
+use codecrafters_dns_server::{DnsHeader, DnsPacketBuffer, MessageWriter, Question};
 
 fn main() {
     println!("Logs from your program will appear here!");
@@ -11,27 +11,25 @@ fn main() {
     loop {
         match udp_socket.recv_from(&mut buf) {
             Ok((size, source)) => {
+                dbg!(size);
                 let mut parser = DnsPacketBuffer::new(&buf);
-
-                let id = parser
-                    .get_u16()
-                    .expect("Packet too short for Transaction ID");
-                let flags = parser.get_u16().expect("Packet too short for Flags");
-
-                let qr = (flags >> 15) & 1;
-                let opcode = (flags >> 11) & 0xF;
-                let aa = (flags >> 10) & 1;
-
-                println!("Transaction ID: {id}");
-                println!("QR (Query=0/Response=1): {qr}");
-                println!("Opcode: {opcode}");
-                println!("AA (Authoritative): {aa}");
-                println!("Received {} bytes from {}", size, source);
-                let id: [u8; 2] = 1234u16.to_be_bytes();
-                let response = [id[0], id[1], 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-                udp_socket
-                    .send_to(&response, source)
-                    .expect("Failed to send response");
+                let x = DnsHeader::parse(&mut parser).unwrap();
+                dbg!(x);
+                let id = u16::from_be_bytes([buf[0], buf[1]]);
+                let header = DnsHeader::response_with_id(id);
+                let question = Question::new("codecrafters.io");
+                let writer = MessageWriter::new(header, question);
+                let mut out = [0u8; 512];
+                match writer.write(&mut out) {
+                    Ok(n) => {
+                        udp_socket
+                            .send_to(&out[..n], source)
+                            .expect("Failed to send response");
+                    }
+                    Err(_) => {
+                        eprintln!("Failed to write DNS message into buffer; response not sent");
+                    }
+                }
             }
             Err(e) => {
                 eprintln!("Error receiving data: {}", e);
