@@ -1,3 +1,4 @@
+use std::env;
 use std::net::UdpSocket;
 use std::time::Duration;
 
@@ -71,6 +72,22 @@ fn parse_name(packet: &[u8], start_pos: usize) -> Result<(String, usize), String
     Ok((name, next_pos))
 }
 
+fn encode_name_to(vec: &mut Vec<u8>, name: &str) -> Result<(), String> {
+    for label in name.split('.') {
+        let len = label.len();
+        if len == 0 {
+            continue;
+        }
+        if len > 63 {
+            return Err("label too long".into());
+        }
+        vec.push(len as u8);
+        vec.extend_from_slice(label.as_bytes());
+    }
+    vec.push(0);
+    Ok(())
+}
+
 fn qtype_from_u16(v: u16) -> Option<QType> {
     match v {
         1 => Some(QType::A),
@@ -87,7 +104,101 @@ fn qclass_from_u16(v: u16) -> Option<QClass> {
     }
 }
 
+fn build_one_question_query(
+    id: u16,
+    flags: u16,
+    qname: &str,
+    qtype: u16,
+    qclass: u16,
+) -> Result<Vec<u8>, String> {
+    let mut v = Vec::with_capacity(512);
+    v.extend_from_slice(&id.to_be_bytes());
+    v.extend_from_slice(&flags.to_be_bytes());
+    v.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT = 1
+    v.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT = 0
+    v.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT = 0
+    v.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT = 0
+
+    encode_name_to(&mut v, qname)?;
+    v.extend_from_slice(&qtype.to_be_bytes());
+    v.extend_from_slice(&qclass.to_be_bytes());
+    Ok(v)
+}
+
+fn parse_a_answers(packet: &[u8]) -> Result<Vec<[u8; 4]>, String> {
+    if packet.len() < 12 {
+        return Err("response too small".into());
+    }
+    let ancount = u16::from_be_bytes([packet[6], packet[7]]) as usize;
+    let qdcount = u16::from_be_bytes([packet[4], packet[5]]) as usize;
+
+    let mut pos = 12usize;
+
+    // skip questions
+    for _ in 0..qdcount {
+        let (_, next_pos) = parse_name(packet, pos)?;
+        pos = next_pos;
+        if pos + 4 > packet.len() {
+            return Err("truncated question".into());
+        }
+        pos += 4; // QTYPE + QCLASS
+    }
+
+    let mut answers = Vec::new();
+    for _ in 0..ancount {
+        let (_name, next_pos) = parse_name(packet, pos)?;
+        pos = next_pos;
+        if pos + 10 > packet.len() {
+            return Err("truncated answer header".into());
+        }
+        let typ = u16::from_be_bytes([packet[pos], packet[pos + 1]]);
+        let _class = u16::from_be_bytes([packet[pos + 2], packet[pos + 3]]);
+        let _ttl = u32::from_be_bytes([
+            packet[pos + 4],
+            packet[pos + 5],
+            packet[pos + 6],
+            packet[pos + 7],
+        ]);
+        let rdlength = u16::from_be_bytes([packet[pos + 8], packet[pos + 9]]) as usize;
+        pos += 10;
+        if pos + rdlength > packet.len() {
+            return Err("truncated rdata".into());
+        }
+        if typ == 1 && rdlength == 4 {
+            let ip = [
+                packet[pos],
+                packet[pos + 1],
+                packet[pos + 2],
+                packet[pos + 3],
+            ];
+            answers.push(ip);
+        }
+        pos += rdlength;
+    }
+
+    Ok(answers)
+}
+
 fn main() {
+    let mut args = env::args().skip(1);
+    let mut resolver_addr: Option<String> = None;
+    while let Some(arg) = args.next() {
+        if arg == "--resolver" {
+            resolver_addr = args.next();
+            break;
+        }
+    }
+    let resolver_addr = match resolver_addr {
+        Some(a) => a,
+        None => {
+            eprintln!(
+                "Usage: {} --resolver <ip:port>",
+                env::args().next().unwrap_or_default()
+            );
+            return;
+        }
+    };
+
     let socket = match UdpSocket::bind("127.0.0.1:2053") {
         Ok(s) => s,
         Err(e) => {
@@ -96,110 +207,168 @@ fn main() {
         }
     };
 
+    let resolver_socket = match UdpSocket::bind("0.0.0.0:0") {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to create resolver socket: {}", e);
+            return;
+        }
+    };
+
+    let _ = resolver_socket.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = socket.set_read_timeout(Some(Duration::from_secs(5)));
 
-    println!("Listening on 127.0.0.1:2053 for DNS queries");
+    println!(
+        "Forwarding DNS server listening on 127.0.0.1:2053, resolver={}",
+        resolver_addr
+    );
 
-    let mut buf = [0u8; 512];
-
+    let mut buf = [0u8; 1500];
     loop {
-        match socket.recv_from(&mut buf) {
-            Ok((size, src)) => {
-                let packet = &buf[..size];
-                if packet.len() < 12 {
-                    eprintln!(
-                        "Received packet too small from {}: {} bytes",
-                        src,
-                        packet.len()
-                    );
-                    continue;
+        let (size, src) = match socket.recv_from(&mut buf) {
+            Ok((s, a)) => (s, a),
+            Err(e) => {
+                eprintln!("recv_from error: {}", e);
+                continue;
+            }
+        };
+        let packet = &buf[..size];
+        if packet.len() < 12 {
+            eprintln!(
+                "Received too-small packet from {} len={}",
+                src,
+                packet.len()
+            );
+            continue;
+        }
+
+        let id = u16::from_be_bytes([packet[0], packet[1]]);
+        let flags = u16::from_be_bytes([packet[2], packet[3]]);
+        let rd = ((flags >> 8) & 1) == 1;
+        let opcode = ((flags >> 11) & 0xF) as u8;
+
+        let qdcount = match read_u16_be(packet, 4) {
+            Some(v) => v,
+            None => {
+                eprintln!("Malformed packet from {}: cannot read QDCOUNT", src);
+                continue;
+            }
+        };
+        if qdcount == 0 {
+            eprintln!("No questions in packet from {}", src);
+            continue;
+        }
+
+        // Parse all questions (supports compression)
+        let mut questions: Vec<(String, u16, u16)> = Vec::new();
+        let mut pos = 12usize;
+        let mut ok = true;
+        for _ in 0..(qdcount as usize) {
+            match parse_name(packet, pos) {
+                Ok((qname, next_pos)) => {
+                    pos = next_pos;
+                    if pos + 4 > packet.len() {
+                        eprintln!("Packet from {} truncated while reading QTYPE/QCLASS", src);
+                        ok = false;
+                        break;
+                    }
+                    let qtype_u16 = u16::from_be_bytes([packet[pos], packet[pos + 1]]);
+                    let qclass_u16 = u16::from_be_bytes([packet[pos + 2], packet[pos + 3]]);
+                    pos += 4;
+                    questions.push((qname, qtype_u16, qclass_u16));
                 }
+                Err(e) => {
+                    eprintln!("Failed to parse QNAME from {}: {}", src, e);
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            continue;
+        }
 
-                let id = u16::from_be_bytes([packet[0], packet[1]]);
+        // For each question, forward exactly one-question query to resolver and collect answers.
+        let mut collected_answers: Vec<Answer> = Vec::new();
+        for (i, (qname, qtype_u16, qclass_u16)) in questions.iter().enumerate() {
+            // Build a single-question query. Use the original packet's opcode and RD.
+            // We'll use the same ID as the original request when forwarding, and do the queries sequentially.
+            let mut forward_flags: u16 = 0;
+            // QR = 0 (query)
+            forward_flags |= ((opcode as u16) & 0xF) << 11;
+            if rd {
+                forward_flags |= 1 << 8;
+            }
 
-                let flags = u16::from_be_bytes([packet[2], packet[3]]);
-                let rd = ((flags >> 8) & 1) == 1;
-                let opcode = ((flags >> 11) & 0xF) as u8;
-
-                let qdcount = match read_u16_be(packet, 4) {
-                    Some(v) => v,
-                    None => {
-                        eprintln!("Malformed packet from {}: cannot read QDCOUNT", src);
+            let query_packet =
+                match build_one_question_query(id, forward_flags, qname, *qtype_u16, *qclass_u16) {
+                    Ok(q) => q,
+                    Err(e) => {
+                        eprintln!("Failed to build forward query for {}: {}", qname, e);
                         continue;
                     }
                 };
-                if qdcount == 0 {
-                    eprintln!("No questions in packet from {}", src);
+
+            if let Err(e) = resolver_socket.send_to(&query_packet, &resolver_addr) {
+                eprintln!("Failed to send query to resolver {}: {}", resolver_addr, e);
+                continue;
+            }
+
+            // Receive response(s). The resolver is expected to reply for a single question.
+            let mut resp_buf = [0u8; 1500];
+            let (rsize, rsrc) = match resolver_socket.recv_from(&mut resp_buf) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("Timeout/recv error from resolver {}: {}", resolver_addr, e);
                     continue;
                 }
+            };
+            // optionally check rsrc == resolver_addr, but resolver_addr may resolve to multiple IPs; skip strict check.
 
-                let mut questions: Vec<Question> = Vec::new();
-                let mut answers: Vec<Answer> = Vec::new();
-                let mut pos = 12usize;
-                let qdcount_usize = qdcount as usize;
-                let mut failed = false;
-
-                for _ in 0..qdcount_usize {
-                    match parse_name(packet, pos) {
-                        Ok((qname, next_pos)) => {
-                            pos = next_pos;
-                            if pos + 4 > packet.len() {
-                                eprintln!(
-                                    "Packet from {} truncated while reading QTYPE/QCLASS",
-                                    src
-                                );
-                                failed = true;
-                                break;
-                            }
-                            let qtype_u16 = u16::from_be_bytes([packet[pos], packet[pos + 1]]);
-                            let qclass_u16 = u16::from_be_bytes([packet[pos + 2], packet[pos + 3]]);
-                            let qtype = qtype_from_u16(qtype_u16).unwrap_or(QType::A);
-                            let qclass = qclass_from_u16(qclass_u16).unwrap_or(QClass::IN);
-                            pos += 4;
-
-                            questions.push(Question::with_type_class(&qname, qtype, qclass));
-
-                            let ip_suffix = (answers.len() as u8).wrapping_add(1);
-                            let ip = [1u8, 2u8, 3u8, ip_suffix];
-                            answers.push(Answer::new(&qname, ip, 60));
-
-                            println!(
-                                "Parsed question from {}: name='{}' qtype={} qclass={}",
-                                src, qname, qtype_u16, qclass_u16
-                            );
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to parse QNAME from {}: {}", src, e);
-                            failed = true;
-                            break;
-                        }
+            let resp_packet = &resp_buf[..rsize];
+            // Parse A records from resolver response
+            match parse_a_answers(resp_packet) {
+                Ok(ips) => {
+                    for ip in ips {
+                        let answer = Answer::new(qname, ip, 60);
+                        collected_answers.push(answer);
                     }
                 }
-
-                if failed {
-                    continue;
+                Err(e) => {
+                    eprintln!("Failed to parse answers from resolver response: {}", e);
                 }
+            }
+        }
 
-                let header =
-                    DnsHeader::response_with_id_and_counts(id, opcode, rd, qdcount, qdcount, 0, 0);
-                let writer = MessageWriter::new_with_sections(header, questions, answers);
+        // Build response header mirroring ID/opcode/RD and RCODE rule
+        let header = DnsHeader::response_with_id_and_counts(
+            id,
+            opcode,
+            rd,
+            qdcount,
+            collected_answers.len() as u16,
+            0,
+            0,
+        );
 
-                match writer.to_vec() {
-                    Ok(resp) => match socket.send_to(&resp, src) {
-                        Ok(n) => {
-                            println!("Sent {} bytes response to {}", n, src);
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to send response to {}: {}", src, e);
-                        }
-                    },
-                    Err(e) => {
-                        eprintln!("Failed to serialize DNS response for {}: {:?}", src, e);
-                    }
+        // Build questions vector (un-compressed) and answers vector
+        let mut q_objs: Vec<Question> = Vec::with_capacity(questions.len());
+        for (qname, qtype_u16, qclass_u16) in &questions {
+            let qtype = qtype_from_u16(*qtype_u16).unwrap_or(QType::A);
+            let qclass = qclass_from_u16(*qclass_u16).unwrap_or(QClass::IN);
+            q_objs.push(Question::with_type_class(qname, qtype, qclass));
+        }
+
+        let writer = MessageWriter::new_with_sections(header, q_objs, collected_answers);
+
+        match writer.to_vec() {
+            Ok(resp) => {
+                if let Err(e) = socket.send_to(&resp, src) {
+                    eprintln!("Failed to send response to {}: {}", src, e);
                 }
             }
             Err(e) => {
-                eprintln!("recv_from error: {}", e);
+                eprintln!("Failed to serialize response: {:?}", e);
             }
         }
     }
